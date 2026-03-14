@@ -307,8 +307,9 @@ async function orderlyPublicFetch(urlPath) {
 
 function getAccountId(walletAddress) {
     const brokerHash = ethers.keccak256(ethers.toUtf8Bytes(BROKER_ID))
+    // Orderly encodes (address, bytes32) — order matters for the hash
     return ethers.keccak256(
-        ethers.AbiCoder.defaultAbiCoder().encode(['bytes32', 'address'], [brokerHash, walletAddress])
+        ethers.AbiCoder.defaultAbiCoder().encode(['address', 'bytes32'], [walletAddress, brokerHash])
     )
 }
 

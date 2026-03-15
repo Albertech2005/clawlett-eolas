@@ -4,8 +4,9 @@
  * Perpetuals trading on perps.eolas.fun via Orderly Network (Safe + Zodiac Roles)
  *
  * perps.eolas.fun is an Orderly Network perp DEX with broker ID "eolas".
- * The agent wallet acts as the Orderly account. USDC flows from the Safe
- * to Orderly via ZodiacHelpers approval + direct Vault.deposit() call.
+ * The Safe is the Orderly on-chain account. The agent's Ed25519 key is
+ * registered as a trading key for the Safe's account via delegateSigner.
+ * USDC flows from the Safe to Orderly via ZodiacHelpers approve + Vault.deposit().
  * Withdrawals land in the agent wallet and can be collected back to Safe.
  *
  * Subcommands:
@@ -119,6 +120,7 @@ const VAULT_ABI = [
     'function deposit((bytes32 accountId, bytes32 brokerHash, bytes32 tokenHash, uint128 tokenAmount) data) external payable',
     'function getDepositFee(address userAddress, (bytes32 accountId, bytes32 brokerHash, bytes32 tokenHash, uint128 tokenAmount) data) external view returns (uint256)',
     'function depositFeeEnabled() external view returns (bool)',
+    'function delegateSigner((bytes32 brokerHash, address delegateSigner) data) external',
 ]
 
 const ERC20_ABI = [
@@ -266,11 +268,12 @@ function signOrderlyRequest(privateKey, timestamp, method, urlPath, body = '') {
     return base64urlEncode(sig)
 }
 
-function buildAuthHeaders(agentAddress, orderlyKey, privateKey, method, urlPath, body = '') {
+// accountAddress: the Orderly account owner = Safe address (not agent)
+function buildAuthHeaders(accountAddress, orderlyKey, privateKey, method, urlPath, body = '') {
     const timestamp = Date.now()
     const signature = signOrderlyRequest(privateKey, timestamp, method, urlPath, body)
     return {
-        'orderly-account-id': `${BROKER_ID}|${agentAddress.toLowerCase()}`,
+        'orderly-account-id': `${BROKER_ID}|${accountAddress.toLowerCase()}`,
         'orderly-key':        getOrderlyKeyStr(orderlyKey.rawPublicKey),
         'orderly-timestamp':  String(timestamp),
         'orderly-signature':  signature,
@@ -313,10 +316,10 @@ function getAccountId(walletAddress) {
     )
 }
 
-async function isAccountRegistered(agentAddress) {
+async function isAccountRegistered(safeAddress) {
     try {
         const res = await fetch(
-            `${ORDERLY_API}/v1/get_account?address=${agentAddress.toLowerCase()}&broker_id=${BROKER_ID}&chain_type=EVM`
+            `${ORDERLY_API}/v1/get_account?address=${safeAddress.toLowerCase()}&broker_id=${BROKER_ID}&chain_type=EVM`
         )
         const data = await res.json()
         return data.success && data.data && !data.data.registration_nonce
@@ -329,9 +332,10 @@ async function isAccountRegistered(agentAddress) {
 // DEPOSIT DATA HELPERS
 // ============================================================================
 
-function buildDepositData(agentAddress, usdcAmount) {
+// safeAddress: the Safe is the Orderly on-chain account — accountId must match msg.sender at Vault
+function buildDepositData(safeAddress, usdcAmount) {
     const brokerHash = ethers.keccak256(ethers.toUtf8Bytes(BROKER_ID))
-    const accountId  = getAccountId(agentAddress)
+    const accountId  = getAccountId(safeAddress)
     const tokenHash  = ethers.keccak256(ethers.toUtf8Bytes('USDC'))
     return {
         accountId,
@@ -509,24 +513,57 @@ async function handleSetup(args) {
     console.log(`Safe:   ${safeAddress}`)
     console.log(`Broker: ${BROKER_ID}`)
 
+    const brokerHash = ethers.keccak256(ethers.toUtf8Bytes(BROKER_ID))
+    const roles = loadRoles(config, agentWallet)
+    const vaultIface = new ethers.Interface(VAULT_ABI)
+
     // --- Step 1: Generate (or load existing) Orderly Ed25519 keypair ---
     const pkPath = path.join(args.configDir, 'orderly.pk')
     let orderlyKey
     if (fs.existsSync(pkPath)) {
-        console.log('\n[1/4] Loading existing Orderly keypair...')
+        console.log('\n[1/5] Loading existing Orderly keypair...')
         orderlyKey = loadOrderlyKey(args.configDir)
         console.log(`   Key: ${getOrderlyKeyStr(orderlyKey.rawPublicKey)}`)
     } else {
-        console.log('\n[1/4] Generating Orderly Ed25519 keypair...')
+        console.log('\n[1/5] Generating Orderly Ed25519 keypair...')
         orderlyKey = generateOrderlyKey()
         saveOrderlyKey(args.configDir, orderlyKey)
         console.log(`   Key: ${getOrderlyKeyStr(orderlyKey.rawPublicKey)}`)
         console.log('   Saved to config/orderly.pk')
     }
 
-    // --- Step 2: Register account with Orderly ---
-    console.log('\n[2/4] Checking Orderly account...')
-    const alreadyRegistered = await isAccountRegistered(agentWallet.address)
+    // --- Step 2: delegateSigner — Safe delegates EIP-712 signing to agent wallet ---
+    // The Safe is the Orderly account owner (on-chain). The agent EOA signs API messages
+    // on its behalf after calling Vault.delegateSigner(brokerHash, agentAddress).
+    console.log('\n[2/5] Registering agent as delegate signer for Safe...')
+    try {
+        const delegateCalldata = vaultIface.encodeFunctionData('delegateSigner', [{
+            brokerHash,
+            delegateSigner: agentWallet.address,
+        }])
+        const delegateTx = await roles.execTransactionWithRole(
+            ORDERLY_VAULT, 0n, delegateCalldata, 0, config.roleKey, true
+        )
+        console.log(`   Tx: ${delegateTx.hash}`)
+        await delegateTx.wait()
+        console.log('   Delegate signer registered ✓')
+        console.log('   Waiting 3s for Orderly to index the event...')
+        await new Promise(r => setTimeout(r, 3000))
+    } catch (err) {
+        if (err.message?.includes('already') || err.message?.includes('delegate')) {
+            console.log('   Already registered ✓')
+        } else {
+            console.log(`   ⚠️  delegateSigner failed: ${err.message}`)
+            console.log('   If Vault is not yet allowed in Roles, run initialize.js first.')
+            console.log('   Continuing — registration may still succeed if already delegated.')
+        }
+    }
+
+    // --- Step 3: Register Safe's account with Orderly ---
+    // userAddress = Safe address (the Orderly account owner)
+    // Signature is from agentWallet (now a registered delegate for the Safe)
+    console.log('\n[3/5] Checking Orderly account for Safe...')
+    const alreadyRegistered = await isAccountRegistered(safeAddress)
 
     if (!alreadyRegistered) {
         console.log('   Not registered — registering now...')
@@ -534,14 +571,14 @@ async function handleSetup(args) {
         // Get registration nonce
         const nonceRes = await fetch(
             `${ORDERLY_API}/v1/registration_nonce`,
-            { headers: { 'orderly-account-id': `${BROKER_ID}|${agentWallet.address.toLowerCase()}` } }
+            { headers: { 'orderly-account-id': `${BROKER_ID}|${safeAddress.toLowerCase()}` } }
         )
         const nonceData = await nonceRes.json()
         if (!nonceData.success) throw new Error(`Failed to get registration nonce: ${nonceData.message}`)
         const registrationNonce = BigInt(nonceData.data.registration_nonce)
         const timestamp = BigInt(Date.now())
 
-        // Sign EIP-712 Registration message
+        // Sign EIP-712 Registration message (agent signs on behalf of Safe)
         const registrationMsg = {
             brokerId:          BROKER_ID,
             chainId:           BigInt(CHAIN_ID),
@@ -550,13 +587,13 @@ async function handleSetup(args) {
         }
         const signature = await agentWallet.signTypedData(ORDERLY_OFFCHAIN_DOMAIN, REGISTRATION_TYPES, registrationMsg)
 
-        // POST to register
+        // POST to register — userAddress is Safe (the account owner)
         const regRes = await fetch(`${ORDERLY_API}/v1/register_account`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 signature,
-                userAddress:       agentWallet.address.toLowerCase(),
+                userAddress:       safeAddress.toLowerCase(),
                 verifyingContract: '0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC',
                 message: {
                     brokerId:          BROKER_ID,
@@ -574,10 +611,10 @@ async function handleSetup(args) {
         console.log('   Already registered ✓')
     }
 
-    // --- Step 3: Add Orderly API key ---
-    console.log('\n[3/4] Adding Orderly API key...')
-    const keyStr    = getOrderlyKeyStr(orderlyKey.rawPublicKey)
-    const timestamp = BigInt(Date.now())
+    // --- Step 4: Add Orderly API key (associated with Safe's account) ---
+    console.log('\n[4/5] Adding Orderly API key...')
+    const keyStr     = getOrderlyKeyStr(orderlyKey.rawPublicKey)
+    const timestamp  = BigInt(Date.now())
     const expiration = timestamp + BigInt(365 * 24 * 60 * 60 * 1000)
 
     const addKeyMsg = {
@@ -595,7 +632,7 @@ async function handleSetup(args) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
             signature:         keySig,
-            userAddress:       agentWallet.address.toLowerCase(),
+            userAddress:       safeAddress.toLowerCase(),
             verifyingContract: '0xCcCCccccCCCCcCCCCCCcCcCccCcCCCcCcccccccC',
             message: {
                 brokerId:   BROKER_ID,
@@ -610,14 +647,13 @@ async function handleSetup(args) {
     })
     const keyData = await keyRes.json()
     if (!keyData.success) {
-        // Key might already be registered — not fatal
         console.log(`   Note: ${keyData.message || 'key may already exist'}`)
     } else {
         console.log('   API key registered ✓')
     }
 
-    // --- Step 4: Configure Zodiac Roles to allow Vault ---
-    console.log('\n[4/4] Checking Roles configuration for Orderly Vault...')
+    // --- Step 5: Configure Zodiac Roles to allow Vault ---
+    console.log('\n[5/5] Checking Roles configuration for Orderly Vault...')
 
     // Check if Vault is already allowed — try a dry-run read
     // We can't easily check allowTarget state directly, so we check config for a marker
@@ -689,7 +725,9 @@ async function handleSetup(args) {
     console.log('\n========================================')
     console.log('         Orderly Setup Complete!')
     console.log('========================================')
-    console.log(`\nAccount ID: ${BROKER_ID}|${agentWallet.address.toLowerCase()}`)
+    console.log(`\nSafe (Orderly account): ${safeAddress}`)
+    console.log(`Account ID: ${BROKER_ID}|${safeAddress.toLowerCase()}`)
+    console.log(`Agent (trading key):    ${agentWallet.address}`)
     console.log(`Orderly Key: ${keyStr}`)
     console.log(`\nNext steps:`)
     console.log('  1. Ensure Vault is allowed in Roles (see Step 4 above)')
@@ -726,8 +764,8 @@ async function handleDeposit(args) {
         process.exit(1)
     }
 
-    // Build deposit data
-    const depositData = buildDepositData(agentWallet.address, depositAmount)
+    // Build deposit data — Safe is the Orderly account, accountId must match msg.sender at Vault
+    const depositData = buildDepositData(safeAddress, depositAmount)
 
     // Get deposit fee
     const vault       = new ethers.Contract(ORDERLY_VAULT, VAULT_ABI, provider)
@@ -747,7 +785,7 @@ async function handleDeposit(args) {
 
     console.log('\nDEPOSIT COMPLETE')
     console.log(`   Amount:  ${formatUSDC(depositAmount)}`)
-    console.log(`   Account: ${BROKER_ID}|${agentWallet.address.toLowerCase()}`)
+    console.log(`   Account: ${BROKER_ID}|${safeAddress.toLowerCase()}`)
     console.log(`   Tx:      ${receipt.hash}`)
     console.log('\n   Note: Balance may take ~1 minute to appear on Orderly.')
 }
@@ -766,9 +804,10 @@ async function handleWithdraw(args) {
     const agentWallet = loadAgentWallet(args.configDir, args.rpc)
     const orderlyKey  = loadOrderlyKey(args.configDir)
     const agentAddr   = agentWallet.address
+    const safeAddress = config.safe
 
-    // Check Orderly balance
-    const balData = await orderlyFetch('GET', '/v1/client/holding', null, agentAddr, orderlyKey)
+    // Check Orderly balance (Safe is the account owner)
+    const balData = await orderlyFetch('GET', '/v1/client/holding', null, safeAddress, orderlyKey)
     const usdcHolding = balData.data?.holding?.find(h => h.token === 'USDC')
     const orderlyBalance = usdcHolding?.holding ?? 0
 
@@ -782,15 +821,15 @@ async function handleWithdraw(args) {
     }
 
     // Get withdrawal nonce
-    const nonceData = await orderlyFetch('GET', '/v1/withdraw_nonce', null, agentAddr, orderlyKey)
+    const nonceData = await orderlyFetch('GET', '/v1/withdraw_nonce', null, safeAddress, orderlyKey)
     const withdrawNonce = BigInt(nonceData.data.withdraw_nonce)
     const timestamp     = BigInt(Date.now())
 
     // Amount in USDC base units (8 decimals for Orderly withdrawal, NOT 6)
-    // Orderly uses 10^8 units internally for amounts in withdrawal EIP-712
     const amountUnits = BigInt(Math.round(withdrawAmount * 1e8))
 
-    // Sign Withdraw EIP-712
+    // Sign Withdraw EIP-712 — agent signs on behalf of Safe's account
+    // Receiver = agent wallet (funds come here, then "collect" sends to Safe)
     const withdrawMsg = {
         brokerId:      BROKER_ID,
         chainId:       BigInt(CHAIN_ID),
@@ -802,10 +841,10 @@ async function handleWithdraw(args) {
     }
     const signature = await agentWallet.signTypedData(ORDERLY_ONCHAIN_DOMAIN, WITHDRAW_TYPES, withdrawMsg)
 
-    // Submit withdrawal request
+    // Submit withdrawal — userAddress is Safe (the Orderly account owner)
     const body = {
         signature,
-        userAddress:       agentAddr.toLowerCase(),
+        userAddress:       safeAddress.toLowerCase(),
         verifyingContract: VERIFY_CONTRACT,
         message: {
             brokerId:      BROKER_ID,
@@ -821,7 +860,7 @@ async function handleWithdraw(args) {
     }
 
     const bodyStr   = JSON.stringify(body)
-    const headers   = buildAuthHeaders(agentAddr, orderlyKey, orderlyKey.privateKey, 'POST', '/v1/withdraw_request', bodyStr)
+    const headers   = buildAuthHeaders(safeAddress, orderlyKey, orderlyKey.privateKey, 'POST', '/v1/withdraw_request', bodyStr)
     const withdrawRes = await fetch(`${ORDERLY_API}/v1/withdraw_request`, { method: 'POST', headers, body: bodyStr })
     const withdrawData = await withdrawRes.json()
     if (!withdrawData.success) throw new Error(`Withdrawal failed: ${withdrawData.message}`)
@@ -905,10 +944,10 @@ async function handleBalance(args) {
     console.log(`  ETH:  ${formatEth(agentEth)}`)
     console.log(`  USDC: ${formatUSDC(agentUsdc)} (collected: send to Safe with "collect --all")`)
 
-    // Orderly balance
+    // Orderly balance (Safe is the Orderly account)
     console.log('\n=== Orderly (perps.eolas.fun) ===')
     try {
-        const balData = await orderlyFetch('GET', '/v1/client/holding', null, agentWallet.address, orderlyKey)
+        const balData = await orderlyFetch('GET', '/v1/client/holding', null, safeAddress, orderlyKey)
         const holdings = balData.data?.holding ?? []
         for (const h of holdings) {
             if (h.holding !== 0 || h.frozen !== 0) {
@@ -924,7 +963,7 @@ async function handleBalance(args) {
 
     // Open positions summary
     try {
-        const posData = await orderlyFetch('GET', '/v1/positions', null, agentWallet.address, orderlyKey)
+        const posData = await orderlyFetch('GET', '/v1/positions', null, safeAddress, orderlyKey)
         const positions = posData.data?.rows ?? []
         if (positions.length > 0) {
             console.log('\n=== Open Positions ===')
@@ -1030,8 +1069,9 @@ async function handleOrder(args, side) {
     }
     if (args.limit) orderBody.order_price = parseFloat(args.limit)
 
+    const safeAddress = config.safe
     console.log(`\nPlacing order...`)
-    const result = await orderlyFetch('POST', '/v1/order', orderBody, agentWallet.address, orderlyKey)
+    const result = await orderlyFetch('POST', '/v1/order', orderBody, safeAddress, orderlyKey)
 
     console.log('\nORDER PLACED')
     console.log(`   Order ID:  ${result.data?.order_id}`)
@@ -1058,8 +1098,9 @@ async function handleClose(args) {
     const orderlyKey  = loadOrderlyKey(args.configDir)
     const perpSym     = symbolToPerpSymbol(args.symbol)
 
+    const safeAddress = config.safe
     // Fetch open position for this symbol
-    const posData  = await orderlyFetch('GET', '/v1/positions', null, agentWallet.address, orderlyKey)
+    const posData  = await orderlyFetch('GET', '/v1/positions', null, safeAddress, orderlyKey)
     const positions = posData.data?.rows ?? []
     const position  = positions.find(p => p.symbol === perpSym)
 
@@ -1087,7 +1128,7 @@ async function handleClose(args) {
         broker_id:      BROKER_ID,
     }
 
-    const result = await orderlyFetch('POST', '/v1/order', orderBody, agentWallet.address, orderlyKey)
+    const result = await orderlyFetch('POST', '/v1/order', orderBody, safeAddress, orderlyKey)
 
     console.log('\nCLOSE ORDER PLACED')
     console.log(`   Order ID: ${result.data?.order_id}`)
@@ -1105,7 +1146,8 @@ async function handlePositions(args) {
     const agentWallet = loadAgentWallet(args.configDir, args.rpc)
     const orderlyKey  = loadOrderlyKey(args.configDir)
 
-    const posData  = await orderlyFetch('GET', '/v1/positions', null, agentWallet.address, orderlyKey)
+    const safeAddress = config.safe
+    const posData  = await orderlyFetch('GET', '/v1/positions', null, safeAddress, orderlyKey)
     const positions = (posData.data?.rows ?? []).filter(p => p.position_qty !== 0)
 
     if (positions.length === 0) {
@@ -1141,7 +1183,8 @@ async function handleOrders(args) {
     const agentWallet = loadAgentWallet(args.configDir, args.rpc)
     const orderlyKey  = loadOrderlyKey(args.configDir)
 
-    const ordersData = await orderlyFetch('GET', '/v1/orders?status=INCOMPLETE', null, agentWallet.address, orderlyKey)
+    const safeAddress = config.safe
+    const ordersData = await orderlyFetch('GET', '/v1/orders?status=INCOMPLETE', null, safeAddress, orderlyKey)
     const orders = ordersData.data?.rows ?? []
 
     if (orders.length === 0) {
@@ -1181,11 +1224,12 @@ async function handleCancel(args) {
     const agentWallet = loadAgentWallet(args.configDir, args.rpc)
     const orderlyKey  = loadOrderlyKey(args.configDir)
 
+    const safeAddress = config.safe
     if (args.orderId) {
         // Cancel single order
         const sym = args.symbol ? `&symbol=${symbolToPerpSymbol(args.symbol)}` : ''
         const path = `/v1/order?order_id=${args.orderId}${sym}`
-        const headers = buildAuthHeaders(agentWallet.address, orderlyKey, orderlyKey.privateKey, 'DELETE', path)
+        const headers = buildAuthHeaders(safeAddress, orderlyKey, orderlyKey.privateKey, 'DELETE', path)
         const res  = await fetch(`${ORDERLY_API}${path}`, { method: 'DELETE', headers })
         const data = await res.json()
         if (!data.success) throw new Error(`Cancel failed: ${data.message}`)
@@ -1194,7 +1238,7 @@ async function handleCancel(args) {
         // Cancel all orders for symbol
         const perpSym = symbolToPerpSymbol(args.symbol)
         const path    = `/v1/orders?symbol=${perpSym}`
-        const headers = buildAuthHeaders(agentWallet.address, orderlyKey, orderlyKey.privateKey, 'DELETE', path)
+        const headers = buildAuthHeaders(safeAddress, orderlyKey, orderlyKey.privateKey, 'DELETE', path)
         const res     = await fetch(`${ORDERLY_API}${path}`, { method: 'DELETE', headers })
         const data    = await res.json()
         if (!data.success) throw new Error(`Cancel all failed: ${data.message}`)

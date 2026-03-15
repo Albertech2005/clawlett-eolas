@@ -4,10 +4,12 @@
  * Perpetuals trading on perps.eolas.fun via Orderly Network (Safe + Zodiac Roles)
  *
  * perps.eolas.fun is an Orderly Network perp DEX with broker ID "eolas".
- * The agent wallet is the Orderly account. USDC flows from the Safe
- * to Orderly via ZodiacHelpers approve + Vault.depositTo(agentAddress, data).
- * depositTo is used (not deposit) so receiver = agentAddress, making the
- * accountId validate correctly against the agent rather than the Safe.
+ * The agent wallet is the Orderly account. USDC flows from the Safe to Orderly
+ * via Safe.execTransaction(USDC.approve) + Roles.execTransactionWithRole(depositTo).
+ * A one-time USDC approval (type(uint256).max) must be set by the Safe OWNER:
+ *   node perps.js setup --owner-key <owner_private_key>
+ * After that, deposits check the existing allowance and skip re-approval.
+ * depositTo is used so receiver=agentAddress, accountId validates against agent.
  * Withdrawals land in the agent wallet and can be collected back to Safe.
  *
  * Subcommands:
@@ -377,8 +379,9 @@ function parseArgs() {
             case '--limit':             result.limit   = args[++i]; break
             case '--amount': case '-a': result.amount  = args[++i]; break
             case '--order-id':          result.orderId = args[++i]; break
-            case '--all':               result.all     = true;      break
-            case '--execute':           result.execute = true;      break
+            case '--all':               result.all      = true;      break
+            case '--execute':           result.execute  = true;      break
+            case '--owner-key':         result.ownerKey = args[++i]; break
             case '--config-dir': case '-c': result.configDir = args[++i]; break
             case '--rpc': case '-r':    result.rpc = args[++i]; break
             case '--help': case '-h':   printHelp(result.subcommand); process.exit(0)
@@ -455,47 +458,67 @@ function loadRoles(config, agentWallet) {
     return new ethers.Contract(config.roles, ROLES_ABI, agentWallet)
 }
 
-// agentWallet.address is passed explicitly as receiver to depositTo() so the Vault
-// validates accountId against the agent address, not msg.sender (the Safe).
+// Sign and execute a Safe transaction using the owner's EIP-712 signature.
+// ownerWallet must match the current Safe owner address.
+async function signAndExecSafeTx(safeAddress, ownerWallet, to, value, data, operation = 0) {
+    const safe = new ethers.Contract(safeAddress, SAFE_ABI, ownerWallet)
+    const nonce = await safe.nonce()
+
+    const domain = { chainId: CHAIN_ID, verifyingContract: safeAddress }
+    const types = {
+        SafeTx: [
+            { name: 'to',             type: 'address' },
+            { name: 'value',          type: 'uint256' },
+            { name: 'data',           type: 'bytes'   },
+            { name: 'operation',      type: 'uint8'   },
+            { name: 'safeTxGas',      type: 'uint256' },
+            { name: 'baseGas',        type: 'uint256' },
+            { name: 'gasPrice',       type: 'uint256' },
+            { name: 'gasToken',       type: 'address' },
+            { name: 'refundReceiver', type: 'address' },
+            { name: 'nonce',          type: 'uint256' },
+        ],
+    }
+    const message = {
+        to, value, data, operation,
+        safeTxGas: 0n, baseGas: 0n, gasPrice: 0n,
+        gasToken: ethers.ZeroAddress, refundReceiver: ethers.ZeroAddress,
+        nonce,
+    }
+    const signature = await ownerWallet.signTypedData(domain, types, message)
+    const tx = await safe.execTransaction(
+        to, value, data, operation, 0n, 0n, 0n,
+        ethers.ZeroAddress, ethers.ZeroAddress,
+        signature,
+    )
+    return tx.wait()
+}
+
+// agentWallet.address is passed as receiver to depositTo() so accountId validates
+// against the agent address, not msg.sender (the Safe).
 //
-// USDC approval uses Safe.execTransaction directly (not ZodiacHelpers.approveForFactory)
-// because approveForFactory has a hardcoded whitelist that only allows DEX factory addresses.
-// The agent signs with v=1 (approved-by-sender) since it is the sole Safe owner.
+// USDC approval: the Safe owner must run `node perps.js setup --owner-key <key>` once
+// to set USDC.approve(OrderlyVault, max). Subsequent deposits skip re-approval when
+// the existing allowance is sufficient.
 async function callVaultDeposit(config, agentWallet, depositData, depositFee) {
     const roles      = loadRoles(config, agentWallet)
-    const safe       = new ethers.Contract(config.safe, SAFE_ABI, agentWallet)
     const vaultIface = new ethers.Interface(VAULT_ABI)
-    const erc20Iface = new ethers.Interface(ERC20_ABI)
+    const usdc       = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, agentWallet.provider)
 
     const usdcAmount = depositData.tokenAmount
 
-    // Step 1: Approve USDC for Vault via Safe.execTransaction
-    // Agent signs directly as Safe owner (v=1 = approved-by-msg.sender pattern).
-    // This bypasses Roles so there is no factory whitelist restriction.
-    console.log(`   Approving USDC for Vault...`)
-    const approveCalldata = erc20Iface.encodeFunctionData('approve', [ORDERLY_VAULT, usdcAmount])
-    // Pre-approved owner signature: [ownerAddress (32 bytes)][0x00 (32 bytes)][0x01]
-    const ownerSig = ethers.concat([
-        ethers.zeroPadValue(agentWallet.address, 32),
-        ethers.zeroPadValue('0x', 32),
-        '0x01',
-    ])
-    const approveTx = await safe.execTransaction(
-        USDC_ADDRESS,          // to
-        0n,                    // value
-        approveCalldata,       // data
-        0,                     // operation = CALL
-        0n,                    // safeTxGas
-        0n,                    // baseGas
-        0n,                    // gasPrice
-        ethers.ZeroAddress,    // gasToken
-        ethers.ZeroAddress,    // refundReceiver
-        ownerSig,              // signatures
-    )
-    console.log(`   Approval tx: ${approveTx.hash}`)
-    const approveReceipt = await approveTx.wait()
-    if (approveReceipt.status !== 1) throw new Error('USDC approval failed')
-    console.log('   Approved ✓')
+    // Step 1: Check USDC allowance — only the Safe owner can approve via setup
+    const allowance = await usdc.allowance(config.safe, ORDERLY_VAULT)
+    if (allowance < usdcAmount) {
+        throw new Error(
+            `Safe has insufficient USDC allowance for OrderlyVault.\n` +
+            `  Current allowance: ${allowance.toString()} (need ${usdcAmount.toString()})\n\n` +
+            `Run this ONCE to set unlimited approval (requires your owner wallet key):\n` +
+            `  node perps.js setup --owner-key <0x_your_private_key>\n\n` +
+            `Your Safe owner address: ${config.owner}`
+        )
+    }
+    console.log(`   USDC allowance sufficient (${allowance.toString()}) ✓`)
 
     // Step 2: Call Vault.depositTo(agentWallet.address, depositData) via Roles
     // Using depositTo so receiver = agentWallet.address, accountId validates against agent not Safe
@@ -713,6 +736,31 @@ async function handleSetup(args) {
     console.log('\n========================================')
     console.log('         Orderly Setup Complete!')
     console.log('========================================')
+    // --- Step 5 (if --owner-key provided): Set one-time USDC approval for OrderlyVault ---
+    const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider)
+    const existingAllowance = await usdc.allowance(config.safe, ORDERLY_VAULT)
+
+    if (existingAllowance > 0n) {
+        console.log('\n[5/5] USDC allowance already set ✓')
+    } else if (args.ownerKey) {
+        console.log('\n[5/5] Setting USDC → OrderlyVault approval (one-time)...')
+        const ownerWallet = new ethers.Wallet(args.ownerKey, provider)
+        console.log(`   Signing as: ${ownerWallet.address}`)
+        if (ownerWallet.address.toLowerCase() !== config.owner.toLowerCase()) {
+            throw new Error(`Owner key mismatch: key is for ${ownerWallet.address} but config.owner is ${config.owner}`)
+        }
+        const erc20Iface = new ethers.Interface(ERC20_ABI)
+        const approveData = erc20Iface.encodeFunctionData('approve', [ORDERLY_VAULT, ethers.MaxUint256])
+        const receipt = await signAndExecSafeTx(config.safe, ownerWallet, USDC_ADDRESS, 0n, approveData)
+        console.log(`   Tx: ${receipt.hash}`)
+        console.log('   USDC approval set ✓ (unlimited — no re-approval needed for future deposits)')
+    } else {
+        console.log('\n[5/5] ⚠️  USDC approval not yet set.')
+        console.log(`   Before depositing, run once with your Safe owner key:`)
+        console.log(`   node perps.js setup --owner-key <0x_your_private_key>`)
+        console.log(`   Safe owner: ${config.owner}`)
+    }
+
     console.log(`\nAccount ID: ${BROKER_ID}|${agentWallet.address.toLowerCase()}`)
     console.log(`Orderly Key: ${keyStr}`)
     console.log(`\nNext steps:`)

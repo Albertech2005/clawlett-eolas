@@ -113,8 +113,16 @@ const ROLES_ABI = [
     'function execTransactionWithRole(address to, uint256 value, bytes data, uint8 operation, bytes32 roleKey, bool shouldRevert) returns (bool)',
 ]
 
+// NOTE: approveForFactory has a hardcoded factory whitelist (DEX routers only).
+// OrderlyVault is NOT in that whitelist, so we cannot use it for deposit approvals.
+// Instead, the Safe approves USDC directly via execTransaction (agent signs as Safe owner).
 const ZODIAC_HELPERS_ABI = [
     'function approveForFactory(address factory, address token, uint256 amount) external',
+]
+
+const SAFE_ABI = [
+    'function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) returns (bool)',
+    'function nonce() view returns (uint256)',
 ]
 
 const VAULT_ABI = [
@@ -130,6 +138,7 @@ const ERC20_ABI = [
     'function balanceOf(address) view returns (uint256)',
     'function allowance(address, address) view returns (uint256)',
     'function transfer(address to, uint256 amount) returns (bool)',
+    'function approve(address spender, uint256 amount) returns (bool)',
 ]
 
 const ROLES_CONFIG_ABI = [
@@ -453,34 +462,47 @@ function loadRoles(config, agentWallet) {
 
 // agentWallet.address is passed explicitly as receiver to depositTo() so the Vault
 // validates accountId against the agent address, not msg.sender (the Safe).
+//
+// USDC approval uses Safe.execTransaction directly (not ZodiacHelpers.approveForFactory)
+// because approveForFactory has a hardcoded whitelist that only allows DEX factory addresses.
+// The agent signs with v=1 (approved-by-sender) since it is the sole Safe owner.
 async function callVaultDeposit(config, agentWallet, depositData, depositFee) {
-    const roles = loadRoles(config, agentWallet)
-    const zodiacHelpers = new ethers.Interface(ZODIAC_HELPERS_ABI)
-    const vaultIface    = new ethers.Interface(VAULT_ABI)
+    const roles      = loadRoles(config, agentWallet)
+    const safe       = new ethers.Contract(config.safe, SAFE_ABI, agentWallet)
+    const vaultIface = new ethers.Interface(VAULT_ABI)
+    const erc20Iface = new ethers.Interface(ERC20_ABI)
 
     const usdcAmount = depositData.tokenAmount
 
-    // Step 1: Approve USDC for Vault via ZodiacHelpers delegatecall
+    // Step 1: Approve USDC for Vault via Safe.execTransaction
+    // Agent signs directly as Safe owner (v=1 = approved-by-msg.sender pattern).
+    // This bypasses Roles so there is no factory whitelist restriction.
     console.log(`   Approving USDC for Vault...`)
-    const approveData = zodiacHelpers.encodeFunctionData('approveForFactory', [
-        ORDERLY_VAULT,
-        USDC_ADDRESS,
-        usdcAmount,
+    const approveCalldata = erc20Iface.encodeFunctionData('approve', [ORDERLY_VAULT, usdcAmount])
+    // Pre-approved owner signature: [ownerAddress (32 bytes)][0x00 (32 bytes)][0x01]
+    const ownerSig = ethers.concat([
+        ethers.zeroPadValue(agentWallet.address, 32),
+        ethers.zeroPadValue('0x', 32),
+        '0x01',
     ])
-    const approveTx = await roles.execTransactionWithRole(
-        config.contracts.ZodiacHelpers,
-        0n,
-        approveData,
-        1, // delegatecall
-        config.roleKey,
-        true,
+    const approveTx = await safe.execTransaction(
+        USDC_ADDRESS,          // to
+        0n,                    // value
+        approveCalldata,       // data
+        0,                     // operation = CALL
+        0n,                    // safeTxGas
+        0n,                    // baseGas
+        0n,                    // gasPrice
+        ethers.ZeroAddress,    // gasToken
+        ethers.ZeroAddress,    // refundReceiver
+        ownerSig,              // signatures
     )
     console.log(`   Approval tx: ${approveTx.hash}`)
     const approveReceipt = await approveTx.wait()
     if (approveReceipt.status !== 1) throw new Error('USDC approval failed')
     console.log('   Approved ✓')
 
-    // Step 2: Call Vault.depositTo(agentWallet.address, depositData)
+    // Step 2: Call Vault.depositTo(agentWallet.address, depositData) via Roles
     // Using depositTo so receiver = agentWallet.address, accountId validates against agent not Safe
     console.log(`   Depositing to Orderly Vault...`)
     const depositCalldata = vaultIface.encodeFunctionData('depositTo', [agentWallet.address, depositData])

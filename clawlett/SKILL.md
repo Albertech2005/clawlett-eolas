@@ -234,78 +234,86 @@ Swap flow:
 Trade perpetuals on **perps.eolas.fun**, powered by [Orderly Network](https://orderly.network) with broker ID `eolas`. Supports 95+ markets on Base Mainnet.
 
 **Architecture:**
-- The agent wallet is the Orderly account (fully automated — no human signature required after setup)
-- USDC is deposited from the Safe into Orderly via ZodiacHelpers approve + direct Vault call
-- Withdrawals go to the agent wallet; use `collect` to send them back to the Safe
-- The Orderly Vault is scoped as an allowed target in Zodiac Roles during initialization
+- **Agent wallet = Orderly account.** Registration, API key, and `accountId` all derive from the agent address. Orderly's `/v1/register_account` does `ecrecover(sig) == userAddress` — the Safe address cannot be used.
+- **Safe = USDC source.** Calls `Vault.depositTo(agentWallet, data)` via Zodiac Roles so the receiver is explicitly the agent (not `msg.sender`). This ensures `accountId` validates against the agent, not the Safe.
+- **USDC approval is a one-time Safe transaction** signed by the human Safe owner (`--owner-key`). Sets `USDC.approve(OrderlyVault, type(uint256).max)`. After this, deposits check allowance and skip re-approval.
+- **Withdrawals** go to the agent wallet. Use `collect` to sweep back to the Safe.
+- **`ZodiacHelpers.approveForFactory` cannot be used** for the Orderly Vault — it has a hardcoded DEX factory whitelist and rejects `0x816f7...`.
 
-**Execution Policy:** Same as swaps — show preview by default, require explicit confirmation before executing on-chain or API orders.
+**Orderly API authentication:**
+- `orderly-account-id` header = `keccak256(abi.encode(agentAddress, keccak256(brokerId)))` — **NOT** `broker|address` format
+- Ed25519 key scope must be `trading,read` — `trading` alone blocks balance/position reads; `read` alone blocks order placement
+- Use `crypto.sign(null, data, key)` for Ed25519 signing — `createSign('Ed25519')` throws on Node.js v24+
 
-### Setup (one-time)
+**Execution Policy:** Same as swaps — show preview by default, require explicit `--execute` flag (or explicit user confirmation) before sending any transaction.
 
-```
-Set up perps trading
-Run perps setup
-```
+---
+
+### One-Time Setup
+
+> Run this once per wallet. Requires both the agent key (agent.pk) and the Safe owner's private key.
 
 ```bash
-node scripts/perps.js setup
+node scripts/perps.js setup --owner-key <0x_safe_owner_private_key>
 ```
 
-This registers the agent with Orderly Network and generates an Ed25519 API key stored in `config/orderly.pk`. The key expires after 365 days and can be regenerated with `--force`.
+What this does:
+1. Generates (or loads) an Ed25519 API keypair → saved to `config/orderly.pk` + `config/orderly.pub`
+2. Registers the agent wallet with Orderly Network (`/v1/register_account`)
+3. Adds the Ed25519 key to the account with scope `trading,read` (`/v1/orderly_key`)
+4. Prints instructions for adding the Orderly Vault to Zodiac Roles (if not already scoped)
+5. Signs and executes a Safe transaction to set `USDC.approve(OrderlyVault, unlimited)` using the owner's EIP-712 signature
 
-**Note for existing wallets:** If your Safe was initialized before perps support, the Orderly Vault may not be scoped in Roles. Re-run `initialize.js --owner <YOUR_ADDRESS>` to add it, or run `perps.js setup` which will advise you.
+The `--owner-key` is only needed for step 5 (the USDC approval). If omitted, setup completes steps 1–4 and prints a reminder to re-run with `--owner-key`.
+
+**If the Ed25519 key seems stale or gives auth errors:**
+```bash
+rm config/orderly.pk config/orderly.pub
+node scripts/perps.js setup --owner-key <key>
+```
+
+---
 
 ### Deposit USDC
 
 ```
 Deposit 100 USDC to Orderly for perps trading
-Deposit 500 USDC into my perps account
 ```
 
 ```bash
-node scripts/perps.js deposit --amount 100
-node scripts/perps.js deposit --amount 100 --execute
+node scripts/perps.js deposit --amount 100            # dry-run preview
+node scripts/perps.js deposit --amount 100 --execute  # actually deposits
 ```
 
-Two-step on-chain process:
-1. Approve USDC for the Orderly Vault (via ZodiacHelpers delegatecall)
-2. Call `Vault.deposit()` directly (Safe → Vault, credited to agent's Orderly account)
+On-chain flow:
+1. Checks Safe's USDC allowance for OrderlyVault — fails with instructions if `setup --owner-key` hasn't been run
+2. Calls `Vault.depositTo(agentWallet.address, depositData)` via `Roles.execTransactionWithRole` — receiver is explicitly the agent wallet
+
+Minimum deposit: no enforced minimum, but Orderly minimum order value is **$10 USDC**.
+
+---
 
 ### Capabilities
 
 | Action | Autonomous | Notes |
 |--------|------------|-------|
-| Setup Orderly account | ⚠️ | One-time; requires explicit confirmation |
+| Setup Orderly account | ⚠️ | One-time; needs `--owner-key` for USDC approval |
 | Check Orderly balance | ✅ | Shows Orderly, Safe, and agent USDC |
 | List markets | ✅ | 95+ perp markets on Base |
 | Get price / market info | ✅ | Mark price, funding rate, OI |
-| Deposit USDC | ⚠️ | Requires explicit confirmation |
-| Withdraw USDC | ⚠️ | Requires explicit confirmation |
-| Collect to Safe | ⚠️ | Forwards agent USDC → Safe; requires explicit confirmation |
-| Open long position | ⚠️ | Market or limit; requires explicit confirmation |
-| Open short position | ⚠️ | Market or limit; requires explicit confirmation |
-| Close position | ⚠️ | Market close; requires explicit confirmation |
+| Deposit USDC | ⚠️ | Requires `--execute`; USDC approval must be set first |
+| Withdraw USDC | ⚠️ | Requires `--execute` |
+| Collect to Safe | ⚠️ | Forwards agent USDC → Safe; requires `--execute` |
+| Open long position | ⚠️ | Market or limit; requires `--execute`; min $10 notional |
+| Open short position | ⚠️ | Market or limit; requires `--execute`; min $10 notional |
+| Close position | ⚠️ | Market close; requires `--execute` |
 | View positions | ✅ | Shows all open positions + unrealized PnL |
 | View open orders | ✅ | Lists all pending orders |
-| Cancel order | ⚠️ | Requires explicit confirmation |
+| Cancel order | ⚠️ | Requires `--execute` |
 
-### Trading
+---
 
-```
-Check my Orderly balance
-What perp markets are available?
-What's the ETH perp price?
-
-Long 0.01 ETH perp
-Short 0.005 BTC perp
-Long ETH perp with $50 notional
-Open a limit long on ETH at 2000
-
-Close my ETH position
-Show my open positions
-Cancel order 12345
-```
+### Trading Commands
 
 ```bash
 # Balance and markets
@@ -314,38 +322,59 @@ node scripts/perps.js markets
 node scripts/perps.js markets --filter BTC
 node scripts/perps.js price --symbol ETH
 
-# Open positions (market order, preview then execute)
-node scripts/perps.js long  --symbol ETH --size 0.01
-node scripts/perps.js long  --symbol ETH --size 0.01 --execute
-node scripts/perps.js short --symbol BTC --size 0.001 --execute
-
-# Open with notional USDC value instead of base size
-node scripts/perps.js long  --symbol ETH --notional 50 --execute
+# Open positions — preview then execute
+node scripts/perps.js long  --symbol BTC --size 0.00015   # ~$10 min at $70k BTC
+node scripts/perps.js long  --symbol ETH --size 0.005 --execute
+node scripts/perps.js short --symbol BTC --size 0.00015 --execute
 
 # Limit order
-node scripts/perps.js long  --symbol ETH --size 0.01 --limit --price 1950 --execute
+node scripts/perps.js long  --symbol ETH --size 0.005 --limit 1950 --execute
 
 # Close position
-node scripts/perps.js close --symbol ETH
-node scripts/perps.js close --symbol ETH --execute
+node scripts/perps.js close --symbol BTC
+node scripts/perps.js close --symbol BTC --execute
 
-# Orders
+# View state
+node scripts/perps.js positions
 node scripts/perps.js orders
-node scripts/perps.js cancel --order-id 12345 --symbol ETH
 
-# Withdraw flow
-node scripts/perps.js withdraw --amount 100 --execute
+# Cancel order
+node scripts/perps.js cancel --order-id 12345
+
+# Withdraw from Orderly → agent wallet
+node scripts/perps.js withdraw --amount 50 --execute
+
+# Sweep agent wallet → Safe
 node scripts/perps.js collect --all --execute
 ```
 
-**Symbol format:** Use short symbols (`ETH`, `BTC`, `SOL`) — the script resolves them to `PERP_ETH_USDC` automatically.
+**Symbol format:** Use short symbols (`ETH`, `BTC`, `SOL`) — resolved to `PERP_ETH_USDC` etc. automatically.
+
+**Minimum order:** $10 USDC notional value. Below this Orderly returns `-1102`.
+
+---
+
+### Known Gotchas
+
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| `GS026 Invalid owner` | Agent is not a Safe owner (removed during init Step 7) | Use `--owner-key` for Safe txs |
+| `ModuleTransactionFailed` | `approveForFactory` whitelist doesn't include OrderlyVault | Don't use `approveForFactory`; use `Safe.execTransaction` with owner sig |
+| `Invalid digest` | `createSign('Ed25519')` fails on Node.js v24 | Use `crypto.sign(null, data, key)` |
+| `-1004 account id not exist` | `orderly-account-id` header wrong format | Use keccak256 hash, not `broker\|address` |
+| `-1000 scope insufficient` | Ed25519 key registered with `trading` only | Re-register key with `trading,read` scope |
+| `-1616 orderlyKey already exists` | Key registered to a different/old account | Delete `orderly.pk` + `orderly.pub`, re-run setup |
+| `-1102 order value < $10` | Notional below minimum | Increase size; formula: `size = 10 / markPrice` |
+| Deposit runs without `--execute` | Missing flag check in handler | Always use `--execute` to send; default is dry-run |
+
+---
 
 ### Contracts (Base Mainnet — Orderly Network)
 
 | Contract | Address | Description |
 |----------|---------|-------------|
 | Orderly Vault | `0x816f722424B49Cf1275cc86DA9840Fbd5a6167e9` | USDC deposit/withdrawal |
-| Verify Contract | `0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203` | API key registration (EIP-712) |
+| Verify Contract | `0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203` | EIP-712 domain for on-chain messages |
 | USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` | Collateral token (6 decimals) |
 
 Orderly API: `https://api.orderly.org` · Broker ID: `eolas`
